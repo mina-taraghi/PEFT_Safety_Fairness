@@ -1,53 +1,14 @@
 #!/usr/bin/env python3
 """
-Unified IA3 Training Script for SFT and DPO
+Unified P-Tuning Training Script for SFT and DPO
 
-This script consolidates IA3-based training for supervised fine-tuning (SFT)
-and Direct Preference Optimization (DPO)
+- Uses PromptEncoderConfigfrom PEFT.
+- Accepts unified config JSON/YAML with blocks: p_tuning, lora, ia3, prompt_tuning, trainer, etc.
 
-Usage:
-- SFT on ultrafeedback (train_sft/test_sft)
-    python train_finetune_IA3.py --task sft --config uf_sft.json
-
-- DPO on ultrafeedback (train_prefs/test_prefs)
-    python finetune_IA3.py --task dpo --config uf_dpo.json
-
-Supported datasets
-- HuggingFaceH4/ultrafeedback_binarized
-  • SFT: expect split names provided explicitly (e.g., train_sft, test_sft)
-  • DPO: expect split names provided explicitly (e.g., train_prefs, test_prefs)
-- HuggingFaceH4/ultrachat_200k
-  • SFT: expect split names provided explicitly (e.g., train_sft, test_sft)
-
-Data format expectations
-- SFT: each example contains {"messages": [{"role": "...", "content": "..."}]}
-- DPO: each example contains {"chosen": {"messages": [...]}, "rejected": {"messages": [...]}}
-
-Configuration
-- The script reads a single config file (JSON or YAML). Only parameters provided
-  in the config (or via CLI overrides) are passed to the underlying libraries.
-- Required top-level keys:
-    model_name: str            # HF model id
-    data_dir: str              # path prepared via datasets.load_from_disk
-    output_dir: str            # output directory
-    train_split: str           # name of training split in the dataset
-    eval_split: str|null       # name of evaluation split, or null to disable
-- Optional top-level keys:
-    seed: int|null
-    gemma_safe: bool           # set true when using Gemma chat template
-    max_seq_length: int|null   # SFTTrainer argument (set only if provided)
-    packing: bool|null         # SFTTrainer argument (set only if provided)
-    padding_side: str|null     # tokenizer padding side (used only if provided)
-    num_proc: int|null         # parallelism for dataset mapping (used only if provided)
-IA3 configuration block:
-    IA3:
-      target_modules: list[str]
-      feedforward_modules: bool|null
-
-- Trainer configuration block:
-    trainer:                   # passed directly to TrainingArguments (SFT) or DPOConfig (DPO)
-Notes
-- Seeds are set only if provided.
+Datasets:
+- UltraFeedback-binarized or UltraChat-200k loaded via datasets.load_from_disk (DatasetDict)
+- SFT splits: train_sft / test_sft with "messages"
+- DPO splits: train_prefs / test_prefs with "chosen"/"rejected"
 """
 
 import os
@@ -60,64 +21,16 @@ from typing import Optional, Dict, Any
 
 import torch
 from datasets import load_from_disk, DatasetDict
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    TrainingArguments,
-)
-from peft import IA3Config
+from transformers import AutoTokenizer, TrainingArguments
+from peft import PromptEncoderConfig  # P-TUNING
 from trl import SFTTrainer, DPOTrainer, DPOConfig
 
-LOG = logging.getLogger("finetune_IA3")
+LOG = logging.getLogger("train_ptuning")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S",
 )
-
-def infer_default_train_pct(data_dir: str, task: str) -> float | None:
-    """
-    If no train_percentage is provided, use your defaults based on dataset+task:
-      - SFT: ultrafeedback = 34%, ultrachat = 10%
-      - DPO: ultrafeedback = 34%
-    Otherwise return None (caller may skip sampling).
-    """
-    name = (data_dir or "").lower()
-    is_ufb = "ultrafeedback" in name
-    is_uc  = "ultrachat" in name
-    if "ultrafeedback" in name: 
-        return 34.0
-    elif "ultrachat" in name:  
-        return 10.0
-    return None
-
-def sample_split(
-    raw: DatasetDict,
-    split: str,
-    percentage: float,
-    seed: int = 42
-) -> DatasetDict:
-    """
-    Return a new DatasetDict where `split` is replaced by a random subset
-    containing `percentage`% of its rows; all other splits stay unchanged.
-    """
-    if not isinstance(raw, DatasetDict):
-        raise ValueError("Expected a DatasetDict.")
-    if split not in raw:
-        raise KeyError(f"Split '{split}' not found in dataset.")
-    if not (0 < percentage <= 100):
-        raise ValueError("percentage must be in (0, 100].")
-
-    random.seed(seed)
-    n = len(raw[split])
-    k = max(1, int((percentage / 100.0) * n))
-    idx = random.sample(range(n), k)
-
-    # Rebuild with the sampled split
-    out = {}
-    for ksplit, dset in raw.items():
-        out[ksplit] = dset.select(idx) if ksplit == split else dset
-    return DatasetDict(out)
 
 
 def set_seed_opt(seed: Optional[int] = None):
@@ -147,6 +60,45 @@ def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
             out[k] = v
     return out
 
+def infer_default_train_pct(data_dir: str, task: str) -> float | None:
+    """
+    If no train_percentage is provided, use your defaults based on dataset+task:
+      - SFT: ultrafeedback = 34%, ultrachat = 10%
+      - DPO: ultrafeedback = 34%
+    Otherwise return None (caller may skip sampling).
+    """
+    name = (data_dir or "").lower()
+    is_ufb = "ultrafeedback" in name
+    is_uc  = "ultrachat" in name
+    if "ultrafeedback" in name: 
+        return 34.0
+    elif "ultrachat" in name:  
+        return 10.0
+    return None
+
+def sample_split(raw: DatasetDict, split: str, percentage: float, seed: int = 42) -> DatasetDict:
+    """
+    Replace `split` with a random subset of size percentage% (0 < p <= 100).
+    Other splits remain unchanged.
+    """
+    if not isinstance(raw, DatasetDict):
+        raise ValueError("Expected a DatasetDict.")
+    if split not in raw:
+        raise KeyError(f"Split '{split}' not found in dataset.")
+    if not (0 < percentage <= 100):
+        raise ValueError("percentage must be in (0, 100].")
+
+    random.seed(seed)
+    n = len(raw[split])
+    k = max(1, int((percentage / 100.0) * n))
+    idx = random.sample(range(n), k)
+
+    out = {}
+    for ksplit, dset in raw.items():
+        out[ksplit] = dset.select(idx) if ksplit == split else dset
+    return DatasetDict(out)
+
+
 def apply_chat_template_to_messages(messages, tokenizer: AutoTokenizer, gemma_safe: bool):
     msgs = messages
     if not gemma_safe:
@@ -159,9 +111,6 @@ def map_for_sft(example, tokenizer: AutoTokenizer, gemma_safe: bool):
     return example
 
 def map_for_dpo(example, tokenizer: AutoTokenizer, gemma_safe: bool):
-    # UltraFeedback-binarized may store chosen/rejected as either:
-    #  - list[{'role','content'}, ...]
-    #  - {'messages': list[...]}  (older/other variants)
     def _msgs(x):
         if isinstance(x, dict) and 'messages' in x:
             return x['messages']
@@ -172,6 +121,7 @@ def map_for_dpo(example, tokenizer: AutoTokenizer, gemma_safe: bool):
     example["rejected"] = apply_chat_template_to_messages(rejected_msgs, tokenizer, gemma_safe)
     return example
 
+
 def build_tokenizer(model_name: str, cfg: Dict[str, Any]) -> AutoTokenizer:
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tok.pad_token is None:
@@ -180,19 +130,8 @@ def build_tokenizer(model_name: str, cfg: Dict[str, Any]) -> AutoTokenizer:
         tok.padding_side = cfg["padding_side"]
     return tok
 
-def build_model(model_name: str):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
-    return model
-
-def build_IA3_config(cfg: Dict[str, Any]) -> IA3Config:
-    return IA3Config(
-        target_modules=cfg.get("target_modules"),
-        feedforward_modules=cfg.get("feedforward_modules", None)
-    )
+def build_p_tuning_config(cfg: Dict[str, Any]) -> PromptEncoderConfig:
+    return PromptEncoderConfig(**cfg)
 
 def filter_kwargs(allowed_keys, user_dict):
     return {k: user_dict[k] for k in allowed_keys if k in user_dict}
@@ -210,60 +149,60 @@ def allowed_training_args():
     }
 
 def allowed_dpo_args():
-    return allowed_training_args().union({
-        "beta","max_length","max_prompt_length"
-    })
+    return allowed_training_args().union({"beta","max_length","max_prompt_length"})
 
 def require_keys(cfg: Dict[str, Any], keys):
     missing = [k for k in keys if k not in cfg or cfg[k] is None]
     if missing:
         raise SystemExit(f"Missing required config keys: {missing}")
 
+
 def run_sft(cfg: Dict[str, Any]):
-    # Required keys for SFT
     require_keys(cfg, ["model_name","data_dir","output_dir","train_split"])
-    set_seed_opt(cfg.get("seed", 42))
+    set_seed_opt(cfg.get("seed"))
 
     tokenizer = build_tokenizer(cfg["model_name"], cfg)
-    model = build_model(cfg["model_name"])
-    IA3_conf = build_IA3_config(cfg.get("IA3", {}))
 
     raw = load_from_disk(cfg["data_dir"])
-    if not isinstance(raw, DatasetDict):
-        raise ValueError("SFT expects a DatasetDict.")
-    pct = cfg.get("train_percentage")
-    if pct is None:
-        pct = infer_default_train_pct(cfg.get("data_dir", ""), task="sft")
 
+    # sampling (train split only)
+    train_split = cfg["train_split"]
+    eval_split  = cfg.get("eval_split", None)
+    seed        = cfg.get("seed", 42)
+    pct         = cfg.get("train_percentage")
+    if pct is None:
+        pct = infer_default_train_pct(cfg.get("data_dir",""), task="sft")
     if pct:
         raw = sample_split(raw, split=train_split, percentage=pct, seed=seed)
-
 
     ds = raw.map(lambda ex: map_for_sft(ex, tokenizer, cfg.get("gemma_safe", False)),
                  num_proc=cfg.get("num_proc", None),
                  desc="Applying chat template (SFT)")
 
-    train_split = cfg["train_split"]
-    eval_split = cfg.get("eval_split", None)
-    
     trainer_kwargs = filter_kwargs(allowed_training_args(), cfg.get("trainer", {}))
     trainer_kwargs["output_dir"] = cfg["output_dir"]
-
     args = TrainingArguments(**trainer_kwargs)
 
+    peft_conf = build_p_tuning_config(cfg.get("p_tuning", {}))
+
     trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        peft_config=IA3_conf,
+        model=cfg["model_name"],
+        model_init_kwargs=dict(
+            torch_dtype="auto",
+            use_cache=False,
+            device_map=cfg.get("device_map", "auto")
+        ),
+        args=args,
         train_dataset=ds[train_split],
         eval_dataset=ds[eval_split] if eval_split and eval_split in ds else None,
         dataset_text_field="text",
-        max_seq_length=cfg.get("max_seq_length", None),
-        packing=cfg.get("packing", False),
-        args=args,
+        tokenizer=tokenizer,
+        packing=True,
+        peft_config=peft_conf,
+        max_seq_length=tokenizer.model_max_length,
     )
 
-    LOG.info("Starting SFT training ...")
+    LOG.info("Starting SFT (P-Tuning) ...")
     result = trainer.train()
     trainer.save_state()
     trainer.save_model(cfg["output_dir"])
@@ -272,22 +211,20 @@ def run_sft(cfg: Dict[str, Any]):
     LOG.info("SFT complete. Saved to %s", cfg["output_dir"])
 
 def run_dpo(cfg: Dict[str, Any]):
-    # Required keys for DPO
     require_keys(cfg, ["model_name","data_dir","output_dir","train_split"])
-    set_seed_opt(cfg.get("seed", 42))
+    set_seed_opt(cfg.get("seed"))
 
     tokenizer = build_tokenizer(cfg["model_name"], cfg)
-    model = build_model(cfg["model_name"])
-    IA3_conf = build_IA3_config(cfg.get("IA3", {}))
-
 
     raw = load_from_disk(cfg["data_dir"])
-    if not isinstance(raw, DatasetDict):
-        raise ValueError("DPO expects a DatasetDict.")
-    pct = cfg.get("train_percentage")
-    if pct is None:
-        pct = infer_default_train_pct(cfg.get("data_dir", ""), task="dpo")
 
+    # sampling (train split only)
+    train_split = cfg["train_split"]
+    eval_split  = cfg.get("eval_split", None)
+    seed        = cfg.get("seed", 42)
+    pct         = cfg.get("train_percentage")
+    if pct is None:
+        pct = infer_default_train_pct(cfg.get("data_dir",""), task="dpo")
     if pct:
         raw = sample_split(raw, split=train_split, percentage=pct, seed=seed)
 
@@ -295,24 +232,29 @@ def run_dpo(cfg: Dict[str, Any]):
                  num_proc=cfg.get("num_proc", None),
                  desc="Applying chat template (DPO)")
 
-    train_split = cfg["train_split"]
-    eval_split = cfg.get("eval_split", None)
-
     dpo_kwargs = filter_kwargs(allowed_dpo_args(), cfg.get("trainer", {}))
     dpo_kwargs["output_dir"] = cfg["output_dir"]
-
     args = DPOConfig(**dpo_kwargs)
 
+    peft_conf = build_p_tuning_config(cfg.get("p_tuning", {}))
+
     trainer = DPOTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        peft_config=IA3_conf,
+        model=cfg["model_name"],
+        model_init_kwargs=dict(
+            torch_dtype="bfloat16",
+            use_cache=False,
+            local_files_only=cfg.get("local_files_only", True),
+            device_map=cfg.get("device_map", "auto")
+        ),
+        ref_model=None,
+        args=args,
         train_dataset=ds[train_split],
         eval_dataset=ds[eval_split] if eval_split and eval_split in ds else None,
-        args=args,
+        peft_config=peft_conf,
+        tokenizer=tokenizer
     )
 
-    LOG.info("Starting DPO training ...")
+    LOG.info("Starting DPO (P-Tuning) ...")
     result = trainer.train()
     trainer.save_state()
     trainer.save_model(cfg["output_dir"])
@@ -320,25 +262,35 @@ def run_dpo(cfg: Dict[str, Any]):
     trainer.save_metrics("train", result.metrics)
     LOG.info("DPO complete. Saved to %s", cfg["output_dir"])
 
+
 def parse_cli():
-    p = argparse.ArgumentParser(description="Unified IA3 trainer for SFT or DPO.")
+    p = argparse.ArgumentParser(description="Unified P-Tuning trainer for SFT or DPO.")
     p.add_argument("--task", choices=["sft", "dpo"], required=True, help="Training paradigm.")
     p.add_argument("--config", type=str, required=True, help="YAML or JSON config file path.")
     p.add_argument("--model_name", type=str, help="HF model ID (overrides config).")
     p.add_argument("--data_dir", type=str, help="Path to load_from_disk dataset.")
     p.add_argument("--output_dir", type=str, help="Where to save model/artifacts.")
-    p.add_argument("--train_percentage", type=float, help="Percentage of the training split to sample (0< p <=100).")
     p.add_argument("--seed", type=int, help="Random seed.")
     p.add_argument("--train_split", type=str, help="Training split name.")
     p.add_argument("--eval_split", type=str, help="Evaluation split name (optional).")
+    p.add_argument("--train_percentage", type=float, help="Percentage of the training split to sample (0< p <=100).")
+    p.add_argument("--device_map", type=str, help="Device map (e.g. 'auto').")
+    p.add_argument("--local_files_only", type=str, help="For DPO model_init_kwargs; 'true'/'false'.")
     return p.parse_args()
+
+def _to_bool(v):
+    s = str(v).strip().lower()
+    if s in ("true","1","yes","y"): return True
+    if s in ("false","0","no","n"): return False
+    return v
 
 def main():
     args = parse_cli()
     file_cfg = load_config(args.config)
-    cli_cfg = {k: v for k, v in vars(args).items()
-               if k in {"model_name", "data_dir", "output_dir", "seed", "train_split", "eval_split"} and v is not None}
+    cli_cfg = {k: v for k, v in vars(args).items() if v is not None}
     cfg = deep_update(file_cfg, cli_cfg)
+    if isinstance(cfg.get("local_files_only"), str):
+        cfg["local_files_only"] = _to_bool(cfg["local_files_only"])
 
     if args.task == "sft":
         run_sft(cfg)
